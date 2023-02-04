@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const BnHost = "api.bndev.it"
+
 type Client struct {
 	token string
 }
@@ -500,7 +502,7 @@ func ParamsBuilder(method Method, token string, page int64) (params url.Values) 
 func SendRequest(params url.Values) (response *http.Response, err error) {
 	u := url.URL{
 		Scheme:   "https",
-		Host:     "api.bndev.it",
+		Host:     BnHost,
 		Path:     "cmap/analytics.json",
 		RawQuery: params.Encode(),
 	}
