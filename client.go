@@ -24,10 +24,10 @@ func NewClient(token string) *Client {
 func (c *Client) GetPriceLists() (prices []Price, err error) {
 	q := ParamsBuilder(PbiPrices, c.token, 1)
 	resp, err := SendRequest(q)
-	defer resp.Body.Close()
 	if err != nil {
 		return prices, err
 	}
+	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return prices, err
@@ -237,6 +237,7 @@ func (c *Client) GetPriceLayers() (corpses []CorpusLayer, err error) {
 	if err != nil {
 		return corpses, err
 	}
+	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return corpses, err
