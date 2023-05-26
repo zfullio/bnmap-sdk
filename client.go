@@ -1,13 +1,18 @@
 package bnmap
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"github.com/schollz/progressbar/v3"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -21,22 +26,23 @@ func NewClient(token string) *Client {
 	return &Client{token: token}
 }
 
-func (c *Client) GetPriceLists() (prices []Price, err error) {
+func (c *Client) GetPriceLists(ctx context.Context) ([]Price, error) {
 	q := ParamsBuilder(PbiPrices, c.token, 1)
-	resp, err := SendRequest(q)
+
+	resp, err := SendRequest(ctx, q)
 	if err != nil {
-		return prices, err
+		return nil, err
 	}
+
 	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return prices, err
-	}
+
 	data := RespPrices{}
-	err = json.Unmarshal(responseBody, &data)
+
+	err = data.Decode(bufio.NewReader(resp.Body))
 	if err != nil {
-		return prices, err
+		return nil, fmt.Errorf("failed to unmarshal response body: %w", err)
 	}
+
 	return data.Content, nil
 }
 
@@ -45,6 +51,142 @@ type RespPrices struct {
 	Content []Price `json:"content"`
 	Auth    bool    `json:"auth"`
 }
+
+//func (r *RespPrices) Decode(reader *bufio.Reader) error {
+//	dec := json.NewDecoder(reader)
+//
+//	t, err := dec.Token()
+//	if err != nil {
+//		return fmt.Errorf("token error: %w", err)
+//	}
+//
+//	if t != json.Delim('{') {
+//		return fmt.Errorf("expected {, got %v", t)
+//	}
+//
+//	for dec.More() {
+//		t, err := dec.Token()
+//		if err != nil {
+//			return fmt.Errorf("token error: %w", err)
+//		}
+//
+//		if t == "status" {
+//			var v string
+//
+//			err = dec.Decode(&v)
+//			if err != nil {
+//				return fmt.Errorf("decode error: %w", err)
+//			}
+//
+//			r.Status = v
+//		}
+//
+//		if t == "auth" {
+//			var v bool
+//
+//			err = dec.Decode(&v)
+//			if err != nil {
+//				return fmt.Errorf("decode error: %w", err)
+//			}
+//
+//			r.Auth = v
+//		}
+//
+//		if t != "content" {
+//			continue
+//		}
+//
+//		_, err = dec.Token()
+//		if err != nil {
+//			return fmt.Errorf("token error: %w", err)
+//		}
+//
+//		for dec.More() {
+//			var v Price
+//
+//			err = dec.Decode(&v)
+//			if err != nil {
+//				return fmt.Errorf("decode error: %w", err)
+//			}
+//
+//			r.Content = append(r.Content, v)
+//		}
+//	}
+//
+//	_, err = dec.Token()
+//	if err != nil {
+//		return fmt.Errorf("token error: %w", err)
+//	}
+//
+//	if t != json.Delim('}') {
+//		return fmt.Errorf("expected }, got %v", t)
+//	}
+//
+//	return nil
+//}
+
+func (r *RespPrices) Decode(reader *bufio.Reader) error {
+	dec := json.NewDecoder(reader)
+
+	t, err := dec.Token()
+	if err != nil {
+		return errors.New("failed to read token")
+	}
+
+	if t != json.Delim('{') {
+		return errors.New("expected '{', got " + fmt.Sprint(t))
+	}
+
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return errors.New("failed to read token")
+		}
+
+		switch t {
+		case "status":
+			err = dec.Decode(&r.Status)
+			if err != nil {
+				return errors.New("failed to decode status")
+			}
+		case "auth":
+			err = dec.Decode(&r.Auth)
+			if err != nil {
+				return errors.New("failed to decode auth")
+			}
+		case "content":
+			_, err = dec.Token()
+			if err != nil {
+				return errors.New("failed to read token")
+			}
+
+			for dec.More() {
+				var v Price
+				err = dec.Decode(&v)
+				if err != nil {
+					return errors.New("failed to decode price")
+				}
+				r.Content = append(r.Content, v)
+			}
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to decode field '%s': %w", t, err)
+		}
+	}
+
+	_, err = dec.Token()
+	if err != nil {
+		return errors.New("failed to read token")
+	}
+
+	if t != json.Delim('}') {
+		return errors.New("expected '}', got " + fmt.Sprint(t))
+	}
+
+	return nil
+}
+
 type Price struct {
 	Agreement           string  `json:"agreement"`
 	Area                string  `json:"area"`
@@ -93,48 +235,273 @@ type Price struct {
 	StartSales          string  `json:"start_sales"`
 }
 
-func (c *Client) GetFullDeals() (deals []Deal, err error) {
-	q := ParamsBuilder(PbiFullDeals, c.token, 1)
-	data := RespFullDeals{}
-	err = PrepareResponse(q, &data)
-	if err != nil {
-		return deals, err
-	}
-	deals = append(deals, data.Content.Data...)
-	pages := data.Content.TotalPages
-	bar := progressbar.Default(pages, "Обработка страниц")
-	err = bar.Add(1)
-	if err != nil {
-		log.Printf("Ошибка прогрессбара: %s", err)
-	}
-	//TODO Исправить page <= int(pages)
-	for page := 2; page <= int(pages); page++ {
-		err := bar.Add(1)
-		if err != nil {
-			log.Printf("Ошибка прогрессбара: %s", err)
-		}
-		q := ParamsBuilder(PbiFullDeals, c.token, int64(page))
-		data := RespFullDeals{}
-		err = PrepareResponse(q, &data)
-		if err != nil {
-			return deals, err
-		}
-		deals = append(deals, data.Content.Data...)
-	}
-	return deals, nil
+func (c *Client) GetFullDeals(ctx context.Context) (<-chan []Deal, <-chan error, <-chan bool) {
+	dealsCh := make(chan []Deal)
+	errCh := make(chan error)
+	doneCh := make(chan bool)
+
+	go func() {
+		defer close(dealsCh)
+		defer close(errCh)
+		defer close(doneCh)
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			q := ParamsBuilder(PbiFullDeals, c.token, 1)
+			resp, err := PrepareResponse(ctx, q)
+			if err != nil {
+				errCh <- fmt.Errorf("failed to prepare response: %w", err)
+				return
+			}
+			defer resp.Body.Close()
+
+			var data RespFullDeals
+			err = data.Decode(bufio.NewReader(resp.Body))
+			if err != nil {
+				errCh <- fmt.Errorf("failed to unmarshal response body: %w", err)
+				return
+			}
+
+			dealsCh <- data.Content.Data
+
+			pages := data.Content.TotalPages
+			bar := progressbar.Default(pages, "Processing pages")
+
+			if err := bar.Add(1); err != nil {
+				log.Printf("Progress bar error: %s", err)
+			}
+
+			for page := 2; page <= int(pages); page++ {
+				if err := bar.Add(1); err != nil {
+					log.Printf("Progress bar error: %s", err)
+				}
+
+				q = ParamsBuilder(PbiFullDeals, c.token, int64(page))
+				resp, err = PrepareResponse(ctx, q)
+				if err != nil {
+					errCh <- fmt.Errorf("failed to prepare response for page %d: %w", page, err)
+					return
+				}
+				defer resp.Body.Close()
+
+				var pageData RespFullDeals
+				err = pageData.Decode(bufio.NewReader(resp.Body))
+				if err != nil {
+					errCh <- fmt.Errorf("failed to unmarshal response body for page %d: %w", page, err)
+					return
+				}
+
+				dealsCh <- pageData.Content.Data
+			}
+		}()
+
+		go func() {
+			wg.Wait()
+			doneCh <- true
+		}()
+	}()
+
+	return dealsCh, errCh, doneCh
 }
 
 type RespFullDeals struct {
-	Status  string `json:"status"`
-	Content struct {
-		Page       int64  `json:"page"`
-		PerPage    int64  `json:"per_page"`
-		Total      string `json:"total"`
-		TotalPages int64  `json:"total_pages"`
-		Data       []Deal `json:"data"`
-	} `json:"content"`
-	Auth bool `json:"auth"`
+	Status  string           `json:"status"`
+	Content FullDealsContent `json:"content"`
+	Auth    bool             `json:"auth"`
 }
+
+type FullDealsContent struct {
+	Page       int64  `json:"page"`
+	PerPage    int64  `json:"per_page"`
+	Total      string `json:"total"`
+	TotalPages int64  `json:"total_pages"`
+	Data       []Deal `json:"data"`
+}
+
+func (f *FullDealsContent) Decode(reader *bufio.Reader) error {
+	dec := json.NewDecoder(reader)
+
+	t, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("token error: %w", err)
+	}
+
+	for dec.More() {
+		switch t {
+		case "page":
+			var v int64
+
+			err = dec.Decode(&v)
+			if err != nil {
+				return fmt.Errorf("decode error: %w", err)
+			}
+
+			f.Page = v
+		case "per_page":
+			var v int64
+
+			err = dec.Decode(&v)
+			if err != nil {
+				return fmt.Errorf("decode error: %w", err)
+			}
+
+			f.PerPage = v
+		case "total_pages":
+			var v int64
+
+			err = dec.Decode(&v)
+			if err != nil {
+				return fmt.Errorf("decode error: %w", err)
+			}
+
+			f.TotalPages = v
+		case "total":
+			var v string
+
+			err = dec.Decode(&v)
+			if err != nil {
+				return fmt.Errorf("decode error: %w", err)
+			}
+
+			f.Total = v
+		case "data":
+			for dec.More() {
+				var v Deal
+
+				err = dec.Decode(&v)
+				if err != nil {
+					return fmt.Errorf("decode error: %w", err)
+				}
+
+				f.Data = append(f.Data, v)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *RespFullDeals) Decode(reader *bufio.Reader) error {
+	dec := json.NewDecoder(reader)
+
+	t, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("token error: %w", err)
+	}
+
+	if t != json.Delim('{') {
+		return fmt.Errorf("expected {, got %v", t)
+	}
+
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("token error: %w", err)
+		}
+
+		switch t {
+		case "status":
+			var v string
+
+			err = dec.Decode(&v)
+			if err != nil {
+				return fmt.Errorf("decode error: %w", err)
+			}
+
+			r.Status = v
+		case "auth":
+			var v bool
+
+			err = dec.Decode(&v)
+			if err != nil {
+				return fmt.Errorf("decode error: %w", err)
+			}
+
+			r.Auth = v
+		case "content":
+
+		default:
+			continue
+		}
+
+		if t != "content" {
+			continue
+		}
+
+		_, err = dec.Token()
+		if err != nil {
+			return fmt.Errorf("token error: %w", err)
+		}
+
+		for dec.More() {
+			switch t {
+			case "page":
+				var v int64
+
+				err = dec.Decode(&v)
+				if err != nil {
+					return fmt.Errorf("decode error: %w", err)
+				}
+
+				r.Content.Page = v
+			case "per_page":
+				var v int64
+
+				err = dec.Decode(&v)
+				if err != nil {
+					return fmt.Errorf("decode error: %w", err)
+				}
+
+				r.Content.PerPage = v
+			case "total_pages":
+				var v int64
+
+				err = dec.Decode(&v)
+				if err != nil {
+					return fmt.Errorf("decode error: %w", err)
+				}
+
+				r.Content.TotalPages = v
+			case "total":
+				var v string
+
+				err = dec.Decode(&v)
+				if err != nil {
+					return fmt.Errorf("decode error: %w", err)
+				}
+
+				r.Content.Total = v
+			case "data":
+				for dec.More() {
+					var v Deal
+
+					err = dec.Decode(&v)
+					if err != nil {
+						return fmt.Errorf("decode error: %w", err)
+					}
+
+					r.Content.Data = append(r.Content.Data, v)
+				}
+			}
+		}
+	}
+
+	_, err = dec.Token()
+	if err != nil {
+		return fmt.Errorf("token error: %w", err)
+	}
+
+	if t != json.Delim('}') {
+		return fmt.Errorf("expected }, got %v", t)
+	}
+
+	return nil
+}
+
 type Deal struct {
 	BStartSales  string  `json:"b_start_sales"`
 	BtName       string  `json:"bt_name"`
@@ -167,34 +534,70 @@ type Deal struct {
 	Wholesale    string  `json:"wholesale"`
 }
 
-func (c *Client) GetFullObjects() (objects []Object, err error) {
+func (c *Client) GetFullObjects(ctx context.Context) ([]Object, error) {
 	q := ParamsBuilder(PbiFullObjects, c.token, 1)
-	data := RespFullObjects{}
-	err = PrepareResponse(q, &data)
+
+	resp, err := PrepareResponse(ctx, q)
 	if err != nil {
-		return objects, err
+		return nil, err
 	}
-	objects = append(objects, data.Content.Data...)
+
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read error: %w", err)
+	}
+
+	data := RespFullObjects{}
+
+	err = json.Unmarshal(responseBody, &data)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal error: %w", err)
+	}
+
+	objects := data.Content.Data
 	pages := data.Content.TotalPages
 	bar := progressbar.Default(int64(pages), "Обработка страниц")
+
 	err = bar.Add(1)
 	if err != nil {
 		log.Printf("Ошибка прогрессбара: %s", err)
 	}
+
 	for page := 2; page <= pages; page++ {
 		err := bar.Add(1)
 		if err != nil {
 			log.Printf("Ошибка прогрессбара: %s", err)
 		}
+
 		q := ParamsBuilder(PbiFullObjects, c.token, int64(page))
 		data := RespFullObjects{}
-		err = PrepareResponse(q, &data)
+
+		resp, err := PrepareResponse(ctx, q)
 		if err != nil {
-			return objects, err
+			return nil, fmt.Errorf("prepare error: %w", err)
 		}
+
+		responseBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read error: %w", err)
+		}
+
+		data = RespFullObjects{}
+
+		err = json.Unmarshal(responseBody, &data)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal error: %w", err)
+		}
+
+		resp.Body.Close()
+
 		objects = append(objects, data.Content.Data...)
-		time.Sleep(2 * time.Second)
+
+		time.Sleep(time.Second)
 	}
+
 	return objects, nil
 }
 
@@ -231,25 +634,28 @@ type Object struct {
 	DBFullName    string  `json:"db_fullname"`
 }
 
-func (c *Client) GetPriceLayers() (corpses []CorpusLayer, err error) {
+func (c *Client) GetPriceLayers(ctx context.Context) ([]CorpusLayer, error) {
 	q := ParamsBuilder(Table, c.token, 1)
-	resp, err := SendRequest(q)
+
+	resp, err := SendRequest(ctx, q)
 	if err != nil {
-		return corpses, err
+		return nil, err
 	}
+
 	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
+
+	responseBody, rErr := io.ReadAll(resp.Body)
 	if err != nil {
-		return corpses, err
+		return nil, fmt.Errorf("read body: %w", rErr)
 	}
+
 	data := RespCorpusLayers{}
-	if err != nil {
-		return corpses, err
-	}
+
 	err = json.Unmarshal(responseBody, &data)
 	if err != nil {
-		return corpses, err
+		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
+
 	return data.Content.Data, nil
 }
 
@@ -490,17 +896,19 @@ type Column struct {
 	Type     string `json:"type"`
 }
 
-func ParamsBuilder(method Method, token string, page int64) (params url.Values) {
-	params = url.Values{}
+func ParamsBuilder(method Method, token string, page int64) url.Values {
+	params := url.Values{}
 	params.Add("act", string(method))
 	params.Add("pbi", token)
+
 	if page > 0 {
 		params.Add("page", strconv.FormatInt(page, 10))
 	}
+
 	return params
 }
 
-func SendRequest(params url.Values) (response *http.Response, err error) {
+func SendRequest(ctx context.Context, params url.Values) (*http.Response, error) {
 	u := url.URL{
 		Scheme:   "https",
 		Host:     BnHost,
@@ -508,34 +916,27 @@ func SendRequest(params url.Values) (response *http.Response, err error) {
 		RawQuery: params.Encode(),
 	}
 	reqURL := u.String()
-	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return response, err
+		return nil, fmt.Errorf("request error: %w", err)
 	}
+
 	cl := http.Client{}
-	response, err = cl.Do(req)
+
+	response, reqErr := cl.Do(req)
 	if err != nil {
-		return response, err
+		return nil, fmt.Errorf("request error: %w", reqErr)
 	}
+
 	return response, nil
 }
 
-func PrepareResponse(q url.Values, template any) (err error) {
-	resp, err := SendRequest(q)
+func PrepareResponse(ctx context.Context, q url.Values) (*http.Response, error) {
+	resp, err := SendRequest(ctx, q)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer resp.Body.Close()
-	if err != nil {
-		return err
-	}
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(responseBody, &template)
-	if err != nil {
-		return err
-	}
-	return nil
+
+	return resp, nil
 }
