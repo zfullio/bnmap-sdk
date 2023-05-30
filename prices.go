@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"net/http"
 )
 
 func (c *Client) GetPriceLists(ctx context.Context) (RespPrices, error) {
@@ -18,7 +18,7 @@ func (c *Client) GetPriceLists(ctx context.Context) (RespPrices, error) {
 
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return RespPrices{}, fmt.Errorf("status code %d", resp.StatusCode)
 	}
 
@@ -41,87 +41,85 @@ type RespPrices struct {
 func (r *RespPrices) Decode(reader *bufio.Reader) error {
 	dec := json.NewDecoder(reader)
 
-	t, err := dec.Token()
-	if err != nil {
-		return DecodeTokenError
+	var token json.Token
+
+	var err error
+
+	if token, err = dec.Token(); err != nil {
+		return ErrDecodeToken
 	}
 
-	if t != json.Delim('{') {
-		return errors.New("expected '{', got " + fmt.Sprint(t))
+	if json.Delim('{') != token {
+		return fmt.Errorf("expected {, got %v", token)
 	}
 
 	for dec.More() {
-		t, err := dec.Token()
-		if err != nil {
-			return DecodeTokenError
-		}
-
-		switch t {
+		switch token {
 		case "status":
-			err = dec.Decode(&r.Status)
-			if err != nil {
-				return &DecodeError{msg: fmt.Sprintf("field 'status' failed to decode: %v", err)}
+			if err := dec.Decode(&r.Status); err != nil {
+				return &DecodeError{msg: err.Error()}
 			}
 		case "auth":
-			err = dec.Decode(&r.Auth)
-			if err != nil {
-				return &DecodeError{msg: fmt.Sprintf("field 'auth' failed to decode: %v", err)}
+			if err := dec.Decode(&r.Auth); err != nil {
+				return &DecodeError{msg: err.Error()}
 			}
 		case "content":
-			_, err := dec.Token()
-			if err != nil {
-				return DecodeTokenError
+			var contentToken json.Token
+
+			if contentToken, err = dec.Token(); err != nil {
+				return ErrDecodeToken
 			}
 
-			r.Content = make([]map[string]string, 0, 50)
+			if delim, ok := contentToken.(json.Delim); !ok || delim != '[' {
+				return fmt.Errorf("expected [, got %v", contentToken)
+			}
 
 			for dec.More() {
-				rawRow := make(map[string]interface{}, 0)
+				row := make(map[string]string, 0)
 
-				convRow := make(map[string]string, 50)
+				var raw map[string]interface{}
 
-				err = dec.Decode(&rawRow)
+				var conv string
+
+				err = dec.Decode(&raw)
 				if err != nil {
 					return &DecodeError{msg: err.Error()}
 				}
 
-				for k, v := range rawRow {
-					if v == nil {
+				for k, val := range raw {
+					if val == nil {
 						continue
 					}
 
-					switch v.(type) {
+					switch val := val.(type) {
 					case string:
-						val, ok := v.(string)
-						if !ok {
-							return &DecodeError{msg: fmt.Sprintf("%v", v)}
-						}
-						convRow[k] = val
-					case int64:
-						val, ok := v.(int64)
-						if !ok {
-							return &DecodeError{msg: fmt.Sprintf("%v", v)}
-						}
-						convRow[k] = fmt.Sprintf("%d", val)
-					case float64:
-						val, ok := v.(float64)
-						if !ok {
-							return &DecodeError{msg: fmt.Sprintf("%v", v)}
+						if val == "" {
+							continue
 						}
 
-						convRow[k] = fmt.Sprintf("%f", val)
+						conv = val
+					case int:
+						conv = fmt.Sprintf("%d", val)
+					case float64:
+						conv = fmt.Sprintf("%f", val)
 					default:
-						convRow[k] = fmt.Sprintf("%v", v)
+						conv = fmt.Sprintf("%v", val)
 					}
 
-					r.Content = append(r.Content, convRow)
+					row[k] = conv
 				}
+
+				r.Content = append(r.Content, row)
 			}
 
 			_, err = dec.Token()
 			if err != nil {
-				return DecodeTokenError
+				return ErrDecodeToken
 			}
+		}
+
+		if token, err = dec.Token(); err != nil {
+			return ErrDecodeToken
 		}
 	}
 
